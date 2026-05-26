@@ -30,9 +30,9 @@ struct Cli {
     #[arg(short = 'e', long, env = "S3_ENDPOINT")]
     endpoint: Option<String>,
 
-    /// Content-Type of the uploaded object
-    #[arg(short = 't', long, default_value = "application/octet-stream")]
-    content_type: String,
+    /// Content-Type (auto-detected from key extension if not set)
+    #[arg(short = 't', long)]
+    content_type: Option<String>,
 
     /// Force path-style addressing (auto-enabled for custom endpoints)
     #[arg(short = 'p', long)]
@@ -133,6 +133,14 @@ fn location(
         }
         None => format!("https://{}.s3.{}.amazonaws.com/{}", bucket, region, key),
     }
+}
+
+fn detect_content_type(key: &str) -> &str {
+    std::path::Path::new(key)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .and_then(|ext| mime_guess::from_ext(ext).first_raw())
+        .unwrap_or("application/octet-stream")
 }
 
 struct Uploader {
@@ -243,6 +251,10 @@ fn create_progress_bar(size: u64, known_size: bool) -> ProgressBar {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
+    let content_type = cli
+        .content_type
+        .as_deref()
+        .unwrap_or_else(|| detect_content_type(&cli.key));
     let input = read_input(cli.file)?;
 
     let size = input.size;
@@ -282,36 +294,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .bucket(&cli.bucket)
                 .key(&cli.key)
                 .body(ByteStream::from(Vec::new()))
-                .content_type(&cli.content_type)
+                .content_type(content_type)
                 .send()
                 .await
                 .map(|_| ())
         } else if !is_tty {
             let (counter, done) = spawn_logger(size, known_size, attempt);
             let body = make_body(&input, counter, done, None);
-            send_upload(
-                &client,
-                &cli.bucket,
-                &cli.key,
-                &cli.content_type,
-                size,
-                body,
-            )
-            .await
+            send_upload(&client, &cli.bucket, &cli.key, content_type, size, body).await
         } else {
             let pb = create_progress_bar(size, known_size);
             let counter = Arc::new(AtomicU64::new(0));
             let done = Arc::new(AtomicBool::new(false));
             let body = make_body(&input, counter, done, Some(pb));
-            send_upload(
-                &client,
-                &cli.bucket,
-                &cli.key,
-                &cli.content_type,
-                size,
-                body,
-            )
-            .await
+            send_upload(&client, &cli.bucket, &cli.key, content_type, size, body).await
         };
 
         match result {
@@ -496,18 +492,14 @@ mod tests {
             .message("test")
             .build();
         let err = PutObjectError::generic(meta);
-        let raw = Response::new(
-            StatusCode::try_from(status).unwrap(),
-            SdkBody::from(""),
-        );
+        let raw = Response::new(StatusCode::try_from(status).unwrap(), SdkBody::from(""));
         SdkError::service_error(err, raw)
     }
 
     #[test]
     fn is_retryable_dispatch_failure() {
-        let err = SdkError::dispatch_failure(ConnectorError::timeout(
-            "connection timed out".into(),
-        ));
+        let err =
+            SdkError::dispatch_failure(ConnectorError::timeout("connection timed out".into()));
         assert!(is_retryable(&err));
     }
 
