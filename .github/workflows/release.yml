@@ -25,6 +25,8 @@ jobs:
             os: macos-latest
           - target: x86_64-pc-windows-msvc
             os: windows-latest
+          - target: aarch64-pc-windows-msvc
+            os: windows-latest
 
     steps:
       - uses: actions/checkout@v4
@@ -159,6 +161,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Publish to crates.io
-        run: cargo publish --no-verify --allow-dirty
+        run: cargo publish --no-verify
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}

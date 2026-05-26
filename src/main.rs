@@ -133,6 +133,7 @@ fn file_feeder(path: &std::path::Path, mut sender: hyper_0_14::body::Sender, upl
             Err(e) => {
                 sender.abort();
                 eprintln!("Error opening file: {e}");
+                uploader.finish();
                 return;
             }
         };
@@ -144,6 +145,7 @@ fn file_feeder(path: &std::path::Path, mut sender: hyper_0_14::body::Sender, upl
                 Err(e) => {
                     eprintln!("Error reading file: {e}");
                     sender.abort();
+                    uploader.finish();
                     return;
                 }
             };
