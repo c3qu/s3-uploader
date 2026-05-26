@@ -2,6 +2,12 @@
 name = "s3-uploader"
 version = "0.1.0"
 edition = "2021"
+description = "Minimal, fast CLI for uploading files to Amazon S3 and compatible services (Cloudflare R2, MinIO). Supports pipe input and progress bars."
+license = "MIT"
+repository = "https://github.com/tanxme/s3-uploader"
+readme = "README.md"
+keywords = ["s3", "aws", "upload", "cli", "r2", "minio", "cloudflare", "pipe"]
+categories = ["command-line-utilities"]
 
 [profile.release]
 opt-level = "z"       # optimize for size

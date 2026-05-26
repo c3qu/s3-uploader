@@ -21,13 +21,13 @@ cargo install s3-uploader
 ### Docker
 
 ```bash
-docker pull ghcr.io/user/s3-uploader:latest
+docker pull tanxme/s3-uploader:latest
 ```
 
 ### Pre-built binary
 
 ```bash
-curl -L https://github.com/user/s3-uploader/releases/latest/download/s3-uploader-x86_64-linux -o s3-uploader
+curl -L https://github.com/tanxme/s3-uploader/releases/latest/download/s3-uploader-x86_64-linux -o s3-uploader
 chmod +x s3-uploader
 ```
 
