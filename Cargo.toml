@@ -6,7 +6,7 @@ description = "Minimal, fast CLI for uploading files to Amazon S3 and compatible
 license = "MIT"
 repository = "https://github.com/tanxme/s3-uploader"
 readme = "README.md"
-keywords = ["s3", "aws", "upload", "cli", "r2", "minio", "cloudflare", "pipe"]
+keywords = ["s3", "upload", "cli", "cloudflare", "pipe"]
 categories = ["command-line-utilities"]
 
 [profile.release]
