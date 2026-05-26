@@ -24,6 +24,9 @@ FROM scratch
 COPY --from=builder /s3-uploader /s3-uploader
 COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 
+# Ensure /tmp exists for stdin temp files (scratch has no directories)
+COPY --from=builder /tmp /tmp
+
 ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
 
 ENTRYPOINT ["/s3-uploader"]

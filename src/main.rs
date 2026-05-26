@@ -77,8 +77,9 @@ fn read_input(file: Option<PathBuf>) -> Result<UploadInput, Box<dyn std::error::
         })
     } else {
         // Stream stdin into a temp file instead of buffering in RAM.
-        let tmp_path =
-            std::env::temp_dir().join(format!("s3-uploader-{}", std::process::id()));
+        let tmp_dir = std::env::temp_dir();
+        std::fs::create_dir_all(&tmp_dir)?;
+        let tmp_path = tmp_dir.join(format!("s3-uploader-{}", std::process::id()));
         let mut tmp_file = std::fs::File::create(&tmp_path)?;
         let mut stdin = std::io::stdin().lock();
         let mut buf = [0u8; 64 * 1024];
@@ -392,4 +393,257 @@ fn spawn_logger(size: u64, known_size: bool, attempt: u32) -> (Arc<AtomicU64>, A
     });
 
     (counter, done)
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aws_sdk_s3::error::{ConnectorError, ErrorMetadata, SdkError};
+    use aws_sdk_s3::operation::put_object::PutObjectError;
+    use aws_sdk_s3::primitives::SdkBody;
+    use aws_smithy_runtime_api::http::{Response, StatusCode};
+
+    // -----------------------------------------------------------------------
+    // human_bytes
+    // -----------------------------------------------------------------------
+    #[test]
+    fn human_bytes_exact_bytes() {
+        assert_eq!(human_bytes(0), "0 B");
+        assert_eq!(human_bytes(1), "1 B");
+        assert_eq!(human_bytes(1023), "1023 B");
+    }
+
+    #[test]
+    fn human_bytes_kib() {
+        assert_eq!(human_bytes(1024), "1.0 KiB");
+        assert_eq!(human_bytes(1536), "1.5 KiB");
+        assert_eq!(human_bytes(1024 * 1024 - 1), "1024.0 KiB");
+    }
+
+    #[test]
+    fn human_bytes_mib() {
+        assert_eq!(human_bytes(1024 * 1024), "1.0 MiB");
+        assert_eq!(human_bytes(100 * 1024 * 1024), "100.0 MiB");
+    }
+
+    #[test]
+    fn human_bytes_gib() {
+        assert_eq!(human_bytes(1024 * 1024 * 1024), "1.0 GiB");
+    }
+
+    #[test]
+    fn human_bytes_tib() {
+        assert_eq!(human_bytes(1024 * 1024 * 1024 * 1024), "1.0 TiB");
+    }
+
+    // -----------------------------------------------------------------------
+    // location
+    // -----------------------------------------------------------------------
+    #[test]
+    fn location_aws_default() {
+        let loc = location(&None, "my-bucket", "path/to/obj", "us-east-1", false);
+        assert_eq!(
+            loc,
+            "https://my-bucket.s3.us-east-1.amazonaws.com/path/to/obj"
+        );
+    }
+
+    #[test]
+    fn location_custom_endpoint_path_style() {
+        let loc = location(
+            &Some("https://minio.example.com".into()),
+            "my-bucket",
+            "data.json",
+            "us-east-1",
+            true,
+        );
+        assert_eq!(loc, "https://minio.example.com/my-bucket/data.json");
+    }
+
+    #[test]
+    fn location_custom_endpoint_virtual_hosted() {
+        let loc = location(
+            &Some("https://r2.example.com".into()),
+            "my-bucket",
+            "data.json",
+            "auto",
+            false,
+        );
+        assert_eq!(loc, "https://r2.example.com/data.json");
+    }
+
+    #[test]
+    fn location_custom_endpoint_trailing_slash() {
+        let loc = location(
+            &Some("https://minio.example.com/".into()),
+            "my-bucket",
+            "data.json",
+            "us-east-1",
+            true,
+        );
+        assert_eq!(loc, "https://minio.example.com/my-bucket/data.json");
+    }
+
+    // -----------------------------------------------------------------------
+    // is_retryable
+    // -----------------------------------------------------------------------
+    fn make_service_error(status: u16) -> SdkError<PutObjectError> {
+        let meta = ErrorMetadata::builder()
+            .code("TestError")
+            .message("test")
+            .build();
+        let err = PutObjectError::generic(meta);
+        let raw = Response::new(
+            StatusCode::try_from(status).unwrap(),
+            SdkBody::from(""),
+        );
+        SdkError::service_error(err, raw)
+    }
+
+    #[test]
+    fn is_retryable_dispatch_failure() {
+        let err = SdkError::dispatch_failure(ConnectorError::timeout(
+            "connection timed out".into(),
+        ));
+        assert!(is_retryable(&err));
+    }
+
+    #[test]
+    fn is_retryable_timeout_error() {
+        let err = SdkError::timeout_error("request timed out");
+        assert!(is_retryable(&err));
+    }
+
+    #[test]
+    fn is_retryable_service_429() {
+        assert!(is_retryable(&make_service_error(429)));
+    }
+
+    #[test]
+    fn is_retryable_service_500() {
+        assert!(is_retryable(&make_service_error(500)));
+    }
+
+    #[test]
+    fn is_retryable_service_502() {
+        assert!(is_retryable(&make_service_error(502)));
+    }
+
+    #[test]
+    fn is_retryable_service_503() {
+        assert!(is_retryable(&make_service_error(503)));
+    }
+
+    #[test]
+    fn is_retryable_service_504() {
+        assert!(is_retryable(&make_service_error(504)));
+    }
+
+    #[test]
+    fn is_not_retryable_service_400() {
+        assert!(!is_retryable(&make_service_error(400)));
+    }
+
+    #[test]
+    fn is_not_retryable_service_403() {
+        assert!(!is_retryable(&make_service_error(403)));
+    }
+
+    #[test]
+    fn is_not_retryable_service_404() {
+        assert!(!is_retryable(&make_service_error(404)));
+    }
+
+    #[test]
+    fn is_not_retryable_construction_failure() {
+        let err = SdkError::construction_failure("bad config");
+        assert!(!is_retryable(&err));
+    }
+
+    #[test]
+    fn is_not_retryable_response_error() {
+        let raw = Response::new(StatusCode::try_from(200).unwrap(), SdkBody::from(""));
+        let err = SdkError::response_error("parse failure", raw);
+        assert!(!is_retryable(&err));
+    }
+
+    // -----------------------------------------------------------------------
+    // read_input — file path
+    // -----------------------------------------------------------------------
+    #[test]
+    fn read_input_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("test.txt");
+        std::fs::write(&file_path, b"hello world").unwrap();
+
+        let input = read_input(Some(file_path.clone())).unwrap();
+        assert_eq!(input.size, 11);
+        assert_eq!(input.path, file_path);
+        assert!(!input.is_temp);
+    }
+
+    #[test]
+    fn read_input_nonexistent_file() {
+        let result = read_input(Some(PathBuf::from("/nonexistent/path/foo.bar")));
+        assert!(result.is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // UploadInput Drop — temp file cleanup
+    // -----------------------------------------------------------------------
+    #[test]
+    fn upload_input_drop_removes_temp() {
+        let tmp_path;
+        {
+            let input = UploadInput {
+                path: {
+                    let p = std::env::temp_dir().join("s3-uploader-test-drop");
+                    tmp_path = p.clone();
+                    p
+                },
+                size: 42,
+                is_temp: true,
+            };
+            // create a real file so remove_file can succeed
+            std::fs::write(&input.path, b"test").unwrap();
+            assert!(input.path.exists());
+        } // Drop runs here
+        assert!(!tmp_path.exists());
+    }
+
+    #[test]
+    fn upload_input_drop_keeps_non_temp() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("keep-me.txt");
+        std::fs::write(&path, b"data").unwrap();
+        {
+            let _input = UploadInput {
+                path: path.clone(),
+                size: 4,
+                is_temp: false,
+            };
+        }
+        // File must still exist — is_temp = false means no cleanup.
+        assert!(path.exists());
+    }
+
+    // -----------------------------------------------------------------------
+    // create_progress_bar
+    // -----------------------------------------------------------------------
+    #[test]
+    fn progress_bar_known_size() {
+        let pb = create_progress_bar(1024, true);
+        // Bar with known size should have a non-zero length.
+        assert!(pb.length().unwrap() > 0);
+    }
+
+    #[test]
+    fn progress_bar_unknown_size() {
+        let pb = create_progress_bar(0, false);
+        // Spinner mode — no length.
+        assert!(pb.length().is_none());
+    }
 }
