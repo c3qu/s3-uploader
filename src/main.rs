@@ -1,15 +1,18 @@
 use std::io::{IsTerminal, Read};
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 
 use aws_sdk_s3::primitives::ByteStream;
 use clap::Parser;
 use indicatif::{ProgressBar, ProgressStyle};
 
 #[derive(Parser)]
-#[command(name = "s3-uploader")]
-#[command(about = "Upload files to Amazon S3 or compatible services (MinIO, Cloudflare R2, etc.)")]
+#[command(
+    name = "s3-uploader",
+    version,
+    about = "Upload files to Amazon S3 or compatible services (MinIO, Cloudflare R2, etc.)"
+)]
 struct Cli {
     /// S3 bucket name
     #[arg(short = 'b', long, env = "S3_BUCKET")]
@@ -69,7 +72,13 @@ fn human_bytes(n: u64) -> String {
     }
 }
 
-fn location(endpoint: &Option<String>, bucket: &str, key: &str, region: &str, force_path_style: bool) -> String {
+fn location(
+    endpoint: &Option<String>,
+    bucket: &str,
+    key: &str,
+    region: &str,
+    force_path_style: bool,
+) -> String {
     match endpoint {
         Some(ref ep) => {
             if force_path_style {
@@ -78,10 +87,7 @@ fn location(endpoint: &Option<String>, bucket: &str, key: &str, region: &str, fo
                 format!("{}/{}", ep.trim_end_matches('/'), key)
             }
         }
-        None => format!(
-            "https://{}.s3.{}.amazonaws.com/{}",
-            bucket, region, key
-        ),
+        None => format!("https://{}.s3.{}.amazonaws.com/{}", bucket, region, key),
     }
 }
 
@@ -238,7 +244,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .await?;
     }
 
-    let loc = location(&cli.endpoint, &cli.bucket, &cli.key, &cli.region, force_path_style);
+    let loc = location(
+        &cli.endpoint,
+        &cli.bucket,
+        &cli.key,
+        &cli.region,
+        force_path_style,
+    );
     eprintln!("Done  {size} bytes → {loc}");
     println!("{loc}");
     Ok(())
