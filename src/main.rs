@@ -365,9 +365,6 @@ fn spawn_logger(size: u64, known_size: bool, attempt: u32) -> (Arc<AtomicU64>, A
         interval.tick().await;
         loop {
             interval.tick().await;
-            if d.load(Ordering::Relaxed) {
-                break;
-            }
             let n = c.load(Ordering::Relaxed);
             if attempt > 1 {
                 eprintln!(
@@ -384,6 +381,9 @@ fn spawn_logger(size: u64, known_size: bool, attempt: u32) -> (Arc<AtomicU64>, A
                 eprintln!("  {}/{} ({pct:.0}%)", human_bytes(n), human_bytes(total));
             } else {
                 eprintln!("  {} uploaded", human_bytes(n));
+            }
+            if d.load(Ordering::Relaxed) {
+                break;
             }
         }
     });
