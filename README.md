@@ -27,8 +27,7 @@ docker pull tanxme/s3-uploader:latest
 ### Pre-built binary
 
 ```bash
-curl -L https://github.com/tanxme/s3-uploader/releases/latest/download/s3-uploader-x86_64-linux -o s3-uploader
-chmod +x s3-uploader
+curl -L https://github.com/c3qu/s3-uploader/releases/latest/download/s3-uploader-x86_64-unknown-linux-musl.tar.gz | tar xz
 ```
 
 ## Quick start
