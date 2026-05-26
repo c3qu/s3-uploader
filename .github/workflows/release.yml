@@ -56,6 +56,7 @@ jobs:
         run: choco install upx -y
 
       - name: UPX compress
+        if: matrix.target != 'aarch64-pc-windows-msvc'
         run: upx --best --lzma --force-macos target/${{ matrix.target }}/release/s3-uploader${{ runner.os == 'Windows' && '.exe' || '' }}
 
       - name: Package (Unix)
