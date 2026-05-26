@@ -1,4 +1,4 @@
-use std::io::{IsTerminal, Read};
+use std::io::{IsTerminal, Read, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -50,22 +50,53 @@ struct Cli {
     file: Option<PathBuf>,
 }
 
-enum Input {
-    File { path: PathBuf, size: u64 },
-    Stdin(Arc<Vec<u8>>),
+/// Unified input: always backed by a file on disk.
+/// For stdin, data is streamed into a temporary file to avoid OOM.
+struct UploadInput {
+    path: PathBuf,
+    size: u64,
+    /// Whether this is a temp file that should be cleaned up on drop.
+    is_temp: bool,
 }
 
-fn read_input(file: Option<PathBuf>) -> Result<Input, Box<dyn std::error::Error>> {
+impl Drop for UploadInput {
+    fn drop(&mut self) {
+        if self.is_temp {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+fn read_input(file: Option<PathBuf>) -> Result<UploadInput, Box<dyn std::error::Error>> {
     if let Some(path) = file {
         let meta = std::fs::metadata(&path)?;
-        Ok(Input::File {
+        Ok(UploadInput {
             size: meta.len(),
             path,
+            is_temp: false,
         })
     } else {
-        let mut data = Vec::new();
-        std::io::stdin().read_to_end(&mut data)?;
-        Ok(Input::Stdin(Arc::new(data)))
+        // Stream stdin into a temp file instead of buffering in RAM.
+        let tmp_path =
+            std::env::temp_dir().join(format!("s3-uploader-{}", std::process::id()));
+        let mut tmp_file = std::fs::File::create(&tmp_path)?;
+        let mut stdin = std::io::stdin().lock();
+        let mut buf = [0u8; 64 * 1024];
+        let mut size = 0u64;
+        loop {
+            let n = stdin.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            tmp_file.write_all(&buf[..n])?;
+            size += n as u64;
+        }
+        tmp_file.flush()?;
+        Ok(UploadInput {
+            path: tmp_path,
+            size,
+            is_temp: true,
+        })
     }
 }
 
@@ -159,38 +190,15 @@ fn file_feeder(path: &std::path::Path, mut sender: hyper_0_14::body::Sender, upl
     });
 }
 
-fn memory_feeder(data: Arc<Vec<u8>>, mut sender: hyper_0_14::body::Sender, uploader: Uploader) {
-    tokio::spawn(async move {
-        let chunk_sz: usize = 64 * 1024;
-        let mut offset = 0;
-        while offset < data.len() {
-            let end = std::cmp::min(offset + chunk_sz, data.len());
-            let len = end - offset;
-            let chunk = bytes::Bytes::copy_from_slice(&data[offset..end]);
-            if sender.send_data(chunk).await.is_err() {
-                break;
-            }
-            offset = end;
-            uploader.report(len as u64);
-        }
-        uploader.finish();
-    });
-}
-
 fn make_body(
-    input: &Input,
+    input: &UploadInput,
     counter: Arc<AtomicU64>,
     done: Arc<AtomicBool>,
     pb: Option<ProgressBar>,
 ) -> ByteStream {
     let (sender, body) = hyper_0_14::Body::channel();
     let uploader = Uploader { counter, done, pb };
-
-    match input {
-        Input::File { path, .. } => file_feeder(path, sender, uploader),
-        Input::Stdin(data) => memory_feeder(Arc::clone(data), sender, uploader),
-    }
-
+    file_feeder(&input.path, sender, uploader);
     ByteStream::from_body_0_4(body)
 }
 
@@ -236,10 +244,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     let input = read_input(cli.file)?;
 
-    let (size, known_size) = match &input {
-        Input::File { size, .. } => (*size, true),
-        Input::Stdin(data) => (data.len() as u64, false),
-    };
+    let size = input.size;
+    // We always know the size now — stdin is written to a temp file first.
+    let known_size = true;
 
     if size == 0 {
         eprintln!("Warning: input is empty, uploading 0 bytes");
