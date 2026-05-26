@@ -59,7 +59,7 @@ jobs:
         run: choco install upx -y
 
       - name: UPX compress
-        run: upx --best --lzma target/${{ matrix.target }}/release/s3-uploader${{ runner.os == 'Windows' && '.exe' || '' }}
+        run: upx --best --lzma --force-macos target/${{ matrix.target }}/release/s3-uploader${{ runner.os == 'Windows' && '.exe' || '' }}
 
       - name: Package (Unix)
         if: runner.os != 'Windows'
