@@ -154,7 +154,7 @@ fn file_feeder(
 
             // 优化点：降低高频调用 Instant::now() 带来的 CPU 损耗
             loop_counter += 1;
-            if show_progress && loop_counter % 32 == 0 {
+            if show_progress && loop_counter.is_multiple_of(32) {
                 let now = Instant::now();
                 if now.duration_since(last_display).as_millis() >= 1000 {
                     let total = uploader.count();
@@ -192,6 +192,7 @@ fn file_body(
 
 // ── 2. 流式数据多段并发上传 (支持 Stdin 或大文件) ──
 
+#[allow(clippy::too_many_arguments)]
 async fn upload_multipart_stream<R>(
     client: &aws_sdk_s3::Client,
     bucket: &str,
@@ -400,6 +401,7 @@ where
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn upload_part_with_retry(
     client: &aws_sdk_s3::Client,
     bucket: &str,
