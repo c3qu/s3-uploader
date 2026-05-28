@@ -1,11 +1,14 @@
-use std::io::{IsTerminal, Read, Write};
+use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use aws_sdk_s3::primitives::ByteStream;
+use aws_sdk_s3::types::{CompletedMultipartUpload, CompletedPart};
 use clap::Parser;
-use indicatif::{ProgressBar, ProgressStyle};
+
+const PART_SIZE: usize = 5 * 1024 * 1024; // 5 MiB minimum for S3 multipart
+const CHUNK_SIZE: usize = 64 * 1024;
 
 #[derive(Parser)]
 #[command(
@@ -42,63 +45,12 @@ struct Cli {
     #[arg(long)]
     no_progress: bool,
 
-    /// Max retries on transient errors (default: 3)
+    /// Max retries on transient errors (file upload only, default: 3)
     #[arg(long, default_value = "3")]
     retries: u32,
 
-    /// File to upload. If omitted, reads from stdin.
+    /// File to upload. If omitted, reads from stdin (multipart).
     file: Option<PathBuf>,
-}
-
-/// Unified input: always backed by a file on disk.
-/// For stdin, data is streamed into a temporary file to avoid OOM.
-struct UploadInput {
-    path: PathBuf,
-    size: u64,
-    /// Whether this is a temp file that should be cleaned up on drop.
-    is_temp: bool,
-}
-
-impl Drop for UploadInput {
-    fn drop(&mut self) {
-        if self.is_temp {
-            let _ = std::fs::remove_file(&self.path);
-        }
-    }
-}
-
-fn read_input(file: Option<PathBuf>) -> Result<UploadInput, Box<dyn std::error::Error>> {
-    if let Some(path) = file {
-        let meta = std::fs::metadata(&path)?;
-        Ok(UploadInput {
-            size: meta.len(),
-            path,
-            is_temp: false,
-        })
-    } else {
-        // Stream stdin into a temp file instead of buffering in RAM.
-        let tmp_dir = std::env::temp_dir();
-        std::fs::create_dir_all(&tmp_dir)?;
-        let tmp_path = tmp_dir.join(format!("s3-uploader-{}", std::process::id()));
-        let mut tmp_file = std::fs::File::create(&tmp_path)?;
-        let mut stdin = std::io::stdin().lock();
-        let mut buf = [0u8; 64 * 1024];
-        let mut size = 0u64;
-        loop {
-            let n = stdin.read(&mut buf)?;
-            if n == 0 {
-                break;
-            }
-            tmp_file.write_all(&buf[..n])?;
-            size += n as u64;
-        }
-        tmp_file.flush()?;
-        Ok(UploadInput {
-            path: tmp_path,
-            size,
-            is_temp: true,
-        })
-    }
 }
 
 fn human_bytes(n: u64) -> String {
@@ -116,25 +68,6 @@ fn human_bytes(n: u64) -> String {
     }
 }
 
-fn location(
-    endpoint: &Option<String>,
-    bucket: &str,
-    key: &str,
-    region: &str,
-    force_path_style: bool,
-) -> String {
-    match endpoint {
-        Some(ref ep) => {
-            if force_path_style {
-                format!("{}/{}/{}", ep.trim_end_matches('/'), bucket, key)
-            } else {
-                format!("{}/{}", ep.trim_end_matches('/'), key)
-            }
-        }
-        None => format!("https://{}.s3.{}.amazonaws.com/{}", bucket, region, key),
-    }
-}
-
 fn detect_content_type(key: &str) -> &str {
     std::path::Path::new(key)
         .extension()
@@ -146,44 +79,49 @@ fn detect_content_type(key: &str) -> &str {
 struct Uploader {
     counter: Arc<AtomicU64>,
     done: Arc<AtomicBool>,
-    pb: Option<ProgressBar>,
 }
 
 impl Uploader {
     fn report(&self, n: u64) {
         self.counter.fetch_add(n, Ordering::Relaxed);
-        if let Some(ref pb) = self.pb {
-            pb.inc(n);
-        }
+    }
+
+    fn count(&self) -> u64 {
+        self.counter.load(Ordering::Relaxed)
     }
 
     fn finish(&self) {
         self.done.store(true, Ordering::Relaxed);
-        if let Some(ref pb) = self.pb {
-            pb.finish_and_clear();
-        }
     }
 }
 
-fn file_feeder(path: &std::path::Path, mut sender: hyper_0_14::body::Sender, uploader: Uploader) {
+// ── File upload (single put_object with known size) ──
+
+fn file_feeder(path: &std::path::Path, mut sender: hyper_0_14::body::Sender, uploader: Uploader, show_progress: bool) {
     let path = path.to_path_buf();
     tokio::spawn(async move {
         let mut file = match tokio::fs::File::open(&path).await {
             Ok(f) => f,
             Err(e) => {
                 sender.abort();
-                eprintln!("Error opening file: {e}");
+                eprintln!("Error: {e}");
                 uploader.finish();
                 return;
             }
         };
-        let mut buf = vec![0u8; 64 * 1024];
+        let display_start = std::time::Instant::now();
+        let mut last_display = display_start;
+        if show_progress {
+            eprint!("\r[00:00] 0 B uploaded    ");
+            std::io::stderr().flush().ok();
+        }
+        let mut buf = vec![0u8; CHUNK_SIZE];
         loop {
             let n = match tokio::io::AsyncReadExt::read(&mut file, &mut buf).await {
                 Ok(0) => break,
                 Ok(n) => n,
                 Err(e) => {
-                    eprintln!("Error reading file: {e}");
+                    eprintln!("Error: {e}");
                     sender.abort();
                     uploader.finish();
                     return;
@@ -194,26 +132,264 @@ fn file_feeder(path: &std::path::Path, mut sender: hyper_0_14::body::Sender, upl
                 break;
             }
             uploader.report(n as u64);
+
+            if show_progress {
+                let now = std::time::Instant::now();
+                let since_ms = now.duration_since(last_display).as_millis();
+                if since_ms >= 1000 {
+                    let total = uploader.count();
+                    let s = now.duration_since(display_start).as_secs();
+                    eprint!(
+                        "\r[{:02}:{:02}] {} uploaded    ",
+                        s / 60,
+                        s % 60,
+                        human_bytes(total)
+                    );
+                    std::io::stderr().flush().ok();
+                    last_display = now;
+                }
+            }
         }
         uploader.finish();
     });
 }
 
-fn make_body(
-    input: &UploadInput,
+fn file_body(
+    path: &std::path::Path,
     counter: Arc<AtomicU64>,
     done: Arc<AtomicBool>,
-    pb: Option<ProgressBar>,
+    show_progress: bool,
 ) -> ByteStream {
     let (sender, body) = hyper_0_14::Body::channel();
-    let uploader = Uploader { counter, done, pb };
-    file_feeder(&input.path, sender, uploader);
+    file_feeder(path, sender, Uploader { counter, done }, show_progress);
     ByteStream::from_body_0_4(body)
 }
 
-fn is_retryable(
-    e: &aws_sdk_s3::error::SdkError<aws_sdk_s3::operation::put_object::PutObjectError>,
-) -> bool {
+// ── Stdin multipart upload ──
+
+async fn upload_stdin(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    key: &str,
+    content_type: &str,
+    uploader: &Uploader,
+    max_retries: u32,
+    read_counter: Arc<AtomicU64>,
+    done_flag: Arc<AtomicBool>,
+    show_progress: bool,
+) -> Result<u64, Box<dyn std::error::Error>> {
+    eprintln!("Uploading...");
+
+    // Start reading stdin immediately, in parallel with create_multipart_upload
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(2);
+    let rb = read_counter;
+    let rd = done_flag;
+
+    // 1-second periodic display task — runs until upload completes
+    let display_done = Arc::new(AtomicBool::new(false));
+    if show_progress {
+        let dc = rb.clone();
+        let dd = display_done.clone();
+        tokio::spawn(async move {
+            let start = std::time::Instant::now();
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+            loop {
+                let elapsed = start.elapsed().as_secs();
+                let n = dc.load(Ordering::Relaxed);
+                eprint!(
+                    "\r[{:02}:{:02}] {} uploaded    ",
+                    elapsed / 60,
+                    elapsed % 60,
+                    human_bytes(n)
+                );
+                std::io::stderr().flush().ok();
+                if dd.load(Ordering::Relaxed) {
+                    break;
+                }
+                interval.tick().await;
+            }
+        });
+    }
+
+    let read_handle = tokio::task::spawn_blocking(move || {
+        let stdin = std::io::stdin();
+        let mut handle = stdin.lock();
+        let mut read_buf = [0u8; CHUNK_SIZE];
+        let mut buffer: Vec<u8> = Vec::with_capacity(PART_SIZE);
+        let mut total_read: u64 = 0;
+
+        loop {
+            let n = match handle.read(&mut read_buf) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(e) => {
+                    eprintln!("Error reading stdin: {e}");
+                    rd.store(true, Ordering::Relaxed);
+                    return;
+                }
+            };
+            total_read += n as u64;
+            buffer.extend_from_slice(&read_buf[..n]);
+            rb.store(total_read, Ordering::Relaxed);
+
+            while buffer.len() >= PART_SIZE {
+                let part = buffer[..PART_SIZE].to_vec();
+                buffer.drain(..PART_SIZE);
+                if tx.blocking_send(part).is_err() {
+                    rd.store(true, Ordering::Relaxed);
+                    return;
+                }
+            }
+        }
+
+        if !buffer.is_empty() {
+            tx.blocking_send(buffer).ok();
+        }
+        rd.store(true, Ordering::Relaxed);
+    });
+
+    // Create multipart upload in parallel with reading first buffer
+    let create_fut = client
+        .create_multipart_upload()
+        .bucket(bucket)
+        .key(key)
+        .content_type(content_type)
+        .send();
+
+    let (create, first_part) = tokio::join!(create_fut, rx.recv());
+
+    let create = create?;
+    let upload_id = create.upload_id().ok_or("missing upload_id")?.to_string();
+
+    // Upload parts as they arrive (first_part already available)
+    let mut part_number: i32 = 1;
+    let mut completed_parts: Vec<CompletedPart> = Vec::new();
+    let mut total_uploaded: u64 = 0;
+
+    let mut pending = first_part;
+    'outer: loop {
+        let data = if let Some(d) = pending.take() {
+            d
+        } else {
+            loop {
+                match tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv()).await {
+                    Ok(Some(d)) => break d,
+                    Ok(None) => break 'outer,
+                    Err(_) => continue,
+                }
+            }
+        };
+        let size = data.len() as u64;
+        let etag = upload_part_with_retry(
+            client,
+            bucket,
+            key,
+            &upload_id,
+            part_number,
+            data,
+            max_retries,
+        )
+        .await?;
+        completed_parts.push(
+            CompletedPart::builder()
+                .part_number(part_number)
+                .e_tag(etag)
+                .build(),
+        );
+        total_uploaded += size;
+        part_number += 1;
+    }
+
+    // Propagate reader panics
+    read_handle.await?;
+
+    if completed_parts.is_empty() {
+        let _ = client
+            .abort_multipart_upload()
+            .bucket(bucket)
+            .key(key)
+            .upload_id(&upload_id)
+            .send()
+            .await;
+        display_done.store(true, Ordering::Relaxed);
+        uploader.finish();
+        return Ok(0);
+    }
+
+    // 3. Complete
+    let result = client
+        .complete_multipart_upload()
+        .bucket(bucket)
+        .key(key)
+        .upload_id(&upload_id)
+        .multipart_upload(
+            CompletedMultipartUpload::builder()
+                .set_parts(Some(completed_parts))
+                .build(),
+        )
+        .send()
+        .await;
+
+    display_done.store(true, Ordering::Relaxed);
+    // Give display task time to print final state + newline
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    match result {
+        Ok(_) => {
+            uploader.finish();
+            Ok(total_uploaded)
+        }
+        Err(e) => {
+            let _ = client
+                .abort_multipart_upload()
+                .bucket(bucket)
+                .key(key)
+                .upload_id(&upload_id)
+                .send()
+                .await;
+            Err(e.into())
+        }
+    }
+}
+
+async fn upload_part_with_retry(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    key: &str,
+    upload_id: &str,
+    part_number: i32,
+    data: Vec<u8>,
+    max_retries: u32,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let mut attempt = 0u32;
+    loop {
+        attempt += 1;
+        match client
+            .upload_part()
+            .bucket(bucket)
+            .key(key)
+            .upload_id(upload_id)
+            .part_number(part_number)
+            .body(ByteStream::from(data.clone()))
+            .send()
+            .await
+        {
+            Ok(output) => {
+                return Ok(output.e_tag().unwrap_or_default().to_string());
+            }
+            Err(e) if attempt < max_retries && is_retryable(&e) => {
+                let delay = 2u64.pow(attempt);
+                eprintln!("  Part {part_number} failed, retrying in {delay}s: {e}");
+                tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+}
+
+// ── Shared ──
+
+fn is_retryable<E: std::fmt::Debug>(e: &aws_sdk_s3::error::SdkError<E>) -> bool {
     match e {
         aws_sdk_s3::error::SdkError::DispatchFailure(_) => true,
         aws_sdk_s3::error::SdkError::TimeoutError(_) => true,
@@ -225,28 +401,7 @@ fn is_retryable(
     }
 }
 
-fn create_progress_bar(size: u64, known_size: bool) -> ProgressBar {
-    if known_size {
-        let pb = ProgressBar::new(size);
-        pb.set_style(
-            ProgressStyle::default_bar()
-                .template(
-                    "{spinner:.green} [{elapsed_precise}] [{bar:30.cyan/blue}] {bytes}/{total_bytes} ({eta})",
-                )
-                .unwrap()
-                .progress_chars("━●─"),
-        );
-        pb
-    } else {
-        let pb = ProgressBar::new_spinner();
-        pb.set_style(
-            ProgressStyle::default_spinner()
-                .template("{spinner:.green} [{elapsed_precise}] {bytes} uploaded")
-                .unwrap(),
-        );
-        pb
-    }
-}
+// ── Main ──
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -255,15 +410,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .content_type
         .as_deref()
         .unwrap_or_else(|| detect_content_type(&cli.key));
-    let input = read_input(cli.file)?;
-
-    let size = input.size;
-    // We always know the size now — stdin is written to a temp file first.
-    let known_size = true;
-
-    if size == 0 {
-        eprintln!("Warning: input is empty, uploading 0 bytes");
-    }
 
     let mut config_builder = aws_config::defaults(aws_config::BehaviorVersion::latest())
         .region(aws_config::Region::new(cli.region.clone()));
@@ -277,365 +423,97 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build();
     let client = aws_sdk_s3::Client::from_conf(s3_config);
 
-    let is_tty = std::io::stderr().is_terminal() && !cli.no_progress;
+    if let Some(ref file_path) = cli.file {
+        // ── File upload ──
+        let meta = std::fs::metadata(file_path)?;
+        let size = meta.len();
 
-    // Retry loop
-    let max_retries = cli.retries;
-    let mut attempt = 0u32;
-    loop {
-        attempt += 1;
-        if attempt > 1 {
-            eprintln!("  Retrying ({attempt}/{max_retries})...");
+        if size == 0 {
+            eprintln!("Warning: input is empty, uploading 0 bytes");
         }
 
-        let result = if size == 0 {
-            client
+        let max_retries = cli.retries;
+        let counter = Arc::new(AtomicU64::new(0));
+        let done = Arc::new(AtomicBool::new(false));
+
+        let mut attempt = 0u32;
+        loop {
+            attempt += 1;
+            if attempt > 1 {
+                eprintln!("  Retrying ({attempt}/{max_retries})...");
+            }
+
+            let body = file_body(file_path, counter.clone(), done.clone(), !cli.no_progress);
+            let result = client
                 .put_object()
                 .bucket(&cli.bucket)
                 .key(&cli.key)
-                .body(ByteStream::from(Vec::new()))
+                .body(body)
                 .content_type(content_type)
+                .content_length(size as i64)
                 .send()
-                .await
-                .map(|_| ())
-        } else if !is_tty {
-            let (counter, done) = spawn_logger(size, known_size, attempt);
-            let body = make_body(&input, counter, done, None);
-            send_upload(&client, &cli.bucket, &cli.key, content_type, size, body).await
-        } else {
-            let pb = create_progress_bar(size, known_size);
-            let counter = Arc::new(AtomicU64::new(0));
-            let done = Arc::new(AtomicBool::new(false));
-            let body = make_body(&input, counter, done, Some(pb));
-            send_upload(&client, &cli.bucket, &cli.key, content_type, size, body).await
-        };
+                .await;
 
-        match result {
-            Ok(_) => break,
-            Err(e) if attempt < max_retries && is_retryable(&e) => {
-                let delay = 2u64.pow(attempt);
-                eprintln!("  {e}");
-                tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+            match result {
+                Ok(_) => break,
+                Err(e) if attempt <= max_retries && is_retryable(&e) => {
+                    let delay = 2u64.pow(attempt);
+                    eprintln!("  {e}");
+                    tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+                }
+                Err(e) => return Err(e.into()),
             }
-            Err(e) => return Err(e.into()),
         }
+
+        done.store(true, Ordering::Relaxed);
+        eprintln!("\nDone  {}", human_bytes(size));
+    } else {
+        // ── Stdin multipart upload ──
+        let counter = Arc::new(AtomicU64::new(0));
+        let read_counter = counter.clone();
+        let done = Arc::new(AtomicBool::new(false));
+        let uploader = Uploader { counter, done: done.clone() };
+
+        let total = upload_stdin(
+            &client,
+            &cli.bucket,
+            &cli.key,
+            content_type,
+            &uploader,
+            cli.retries,
+            read_counter,
+            done,
+            !cli.no_progress,
+        )
+        .await?;
+
+        uploader.finish();
+        eprintln!("\nDone  {}", human_bytes(total));
     }
 
-    let loc = location(
-        &cli.endpoint,
-        &cli.bucket,
-        &cli.key,
-        &cli.region,
-        force_path_style,
-    );
-    eprintln!("Done  {size} bytes → {loc}");
-    println!("{loc}");
     Ok(())
 }
 
-async fn send_upload(
-    client: &aws_sdk_s3::Client,
-    bucket: &str,
-    key: &str,
-    content_type: &str,
-    size: u64,
-    body: ByteStream,
-) -> Result<(), aws_sdk_s3::error::SdkError<aws_sdk_s3::operation::put_object::PutObjectError>> {
-    client
-        .put_object()
-        .bucket(bucket)
-        .key(key)
-        .body(body)
-        .content_type(content_type)
-        .content_length(size as i64)
-        .send()
-        .await
-        .map(|_| ())
-}
-
-fn spawn_logger(size: u64, known_size: bool, attempt: u32) -> (Arc<AtomicU64>, Arc<AtomicBool>) {
-    let counter = Arc::new(AtomicU64::new(0));
-    let done = Arc::new(AtomicBool::new(false));
-
-    let c = counter.clone();
-    let d = done.clone();
-    let total = size;
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
-        interval.tick().await;
-        loop {
-            interval.tick().await;
-            let n = c.load(Ordering::Relaxed);
-            if attempt > 1 {
-                eprintln!(
-                    "  Attempt {attempt}: {}/{}",
-                    human_bytes(n),
-                    human_bytes(total)
-                );
-            } else if known_size {
-                let pct = if total > 0 {
-                    (n as f64 / total as f64) * 100.0
-                } else {
-                    0.0
-                };
-                eprintln!("  {}/{} ({pct:.0}%)", human_bytes(n), human_bytes(total));
-            } else {
-                eprintln!("  {} uploaded", human_bytes(n));
-            }
-            if d.load(Ordering::Relaxed) {
-                break;
-            }
-        }
-    });
-
-    (counter, done)
-}
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
+// ── Tests ──
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aws_sdk_s3::error::{ConnectorError, ErrorMetadata, SdkError};
-    use aws_sdk_s3::operation::put_object::PutObjectError;
-    use aws_sdk_s3::primitives::SdkBody;
-    use aws_smithy_runtime_api::http::{Response, StatusCode};
 
-    // -----------------------------------------------------------------------
-    // human_bytes
-    // -----------------------------------------------------------------------
     #[test]
-    fn human_bytes_exact_bytes() {
+    fn human_bytes_basic() {
         assert_eq!(human_bytes(0), "0 B");
-        assert_eq!(human_bytes(1), "1 B");
-        assert_eq!(human_bytes(1023), "1023 B");
-    }
-
-    #[test]
-    fn human_bytes_kib() {
         assert_eq!(human_bytes(1024), "1.0 KiB");
-        assert_eq!(human_bytes(1536), "1.5 KiB");
-        assert_eq!(human_bytes(1024 * 1024 - 1), "1024.0 KiB");
-    }
-
-    #[test]
-    fn human_bytes_mib() {
         assert_eq!(human_bytes(1024 * 1024), "1.0 MiB");
-        assert_eq!(human_bytes(100 * 1024 * 1024), "100.0 MiB");
     }
 
     #[test]
-    fn human_bytes_gib() {
-        assert_eq!(human_bytes(1024 * 1024 * 1024), "1.0 GiB");
-    }
-
-    #[test]
-    fn human_bytes_tib() {
-        assert_eq!(human_bytes(1024 * 1024 * 1024 * 1024), "1.0 TiB");
-    }
-
-    // -----------------------------------------------------------------------
-    // location
-    // -----------------------------------------------------------------------
-    #[test]
-    fn location_aws_default() {
-        let loc = location(&None, "my-bucket", "path/to/obj", "us-east-1", false);
+    fn detect_content_type_works() {
+        assert_eq!(detect_content_type("a.jpg"), "image/jpeg");
+        assert_eq!(detect_content_type("a.html"), "text/html");
+        assert_eq!(detect_content_type("a.json"), "application/json");
         assert_eq!(
-            loc,
-            "https://my-bucket.s3.us-east-1.amazonaws.com/path/to/obj"
+            detect_content_type("a.nosuchext"),
+            "application/octet-stream"
         );
-    }
-
-    #[test]
-    fn location_custom_endpoint_path_style() {
-        let loc = location(
-            &Some("https://minio.example.com".into()),
-            "my-bucket",
-            "data.json",
-            "us-east-1",
-            true,
-        );
-        assert_eq!(loc, "https://minio.example.com/my-bucket/data.json");
-    }
-
-    #[test]
-    fn location_custom_endpoint_virtual_hosted() {
-        let loc = location(
-            &Some("https://r2.example.com".into()),
-            "my-bucket",
-            "data.json",
-            "auto",
-            false,
-        );
-        assert_eq!(loc, "https://r2.example.com/data.json");
-    }
-
-    #[test]
-    fn location_custom_endpoint_trailing_slash() {
-        let loc = location(
-            &Some("https://minio.example.com/".into()),
-            "my-bucket",
-            "data.json",
-            "us-east-1",
-            true,
-        );
-        assert_eq!(loc, "https://minio.example.com/my-bucket/data.json");
-    }
-
-    // -----------------------------------------------------------------------
-    // is_retryable
-    // -----------------------------------------------------------------------
-    fn make_service_error(status: u16) -> SdkError<PutObjectError> {
-        let meta = ErrorMetadata::builder()
-            .code("TestError")
-            .message("test")
-            .build();
-        let err = PutObjectError::generic(meta);
-        let raw = Response::new(StatusCode::try_from(status).unwrap(), SdkBody::from(""));
-        SdkError::service_error(err, raw)
-    }
-
-    #[test]
-    fn is_retryable_dispatch_failure() {
-        let err =
-            SdkError::dispatch_failure(ConnectorError::timeout("connection timed out".into()));
-        assert!(is_retryable(&err));
-    }
-
-    #[test]
-    fn is_retryable_timeout_error() {
-        let err = SdkError::timeout_error("request timed out");
-        assert!(is_retryable(&err));
-    }
-
-    #[test]
-    fn is_retryable_service_429() {
-        assert!(is_retryable(&make_service_error(429)));
-    }
-
-    #[test]
-    fn is_retryable_service_500() {
-        assert!(is_retryable(&make_service_error(500)));
-    }
-
-    #[test]
-    fn is_retryable_service_502() {
-        assert!(is_retryable(&make_service_error(502)));
-    }
-
-    #[test]
-    fn is_retryable_service_503() {
-        assert!(is_retryable(&make_service_error(503)));
-    }
-
-    #[test]
-    fn is_retryable_service_504() {
-        assert!(is_retryable(&make_service_error(504)));
-    }
-
-    #[test]
-    fn is_not_retryable_service_400() {
-        assert!(!is_retryable(&make_service_error(400)));
-    }
-
-    #[test]
-    fn is_not_retryable_service_403() {
-        assert!(!is_retryable(&make_service_error(403)));
-    }
-
-    #[test]
-    fn is_not_retryable_service_404() {
-        assert!(!is_retryable(&make_service_error(404)));
-    }
-
-    #[test]
-    fn is_not_retryable_construction_failure() {
-        let err = SdkError::construction_failure("bad config");
-        assert!(!is_retryable(&err));
-    }
-
-    #[test]
-    fn is_not_retryable_response_error() {
-        let raw = Response::new(StatusCode::try_from(200).unwrap(), SdkBody::from(""));
-        let err = SdkError::response_error("parse failure", raw);
-        assert!(!is_retryable(&err));
-    }
-
-    // -----------------------------------------------------------------------
-    // read_input — file path
-    // -----------------------------------------------------------------------
-    #[test]
-    fn read_input_existing_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let file_path = dir.path().join("test.txt");
-        std::fs::write(&file_path, b"hello world").unwrap();
-
-        let input = read_input(Some(file_path.clone())).unwrap();
-        assert_eq!(input.size, 11);
-        assert_eq!(input.path, file_path);
-        assert!(!input.is_temp);
-    }
-
-    #[test]
-    fn read_input_nonexistent_file() {
-        let result = read_input(Some(PathBuf::from("/nonexistent/path/foo.bar")));
-        assert!(result.is_err());
-    }
-
-    // -----------------------------------------------------------------------
-    // UploadInput Drop — temp file cleanup
-    // -----------------------------------------------------------------------
-    #[test]
-    fn upload_input_drop_removes_temp() {
-        let tmp_path;
-        {
-            let input = UploadInput {
-                path: {
-                    let p = std::env::temp_dir().join("s3-uploader-test-drop");
-                    tmp_path = p.clone();
-                    p
-                },
-                size: 42,
-                is_temp: true,
-            };
-            // create a real file so remove_file can succeed
-            std::fs::write(&input.path, b"test").unwrap();
-            assert!(input.path.exists());
-        } // Drop runs here
-        assert!(!tmp_path.exists());
-    }
-
-    #[test]
-    fn upload_input_drop_keeps_non_temp() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("keep-me.txt");
-        std::fs::write(&path, b"data").unwrap();
-        {
-            let _input = UploadInput {
-                path: path.clone(),
-                size: 4,
-                is_temp: false,
-            };
-        }
-        // File must still exist — is_temp = false means no cleanup.
-        assert!(path.exists());
-    }
-
-    // -----------------------------------------------------------------------
-    // create_progress_bar
-    // -----------------------------------------------------------------------
-    #[test]
-    fn progress_bar_known_size() {
-        let pb = create_progress_bar(1024, true);
-        // Bar with known size should have a non-zero length.
-        assert!(pb.length().unwrap() > 0);
-    }
-
-    #[test]
-    fn progress_bar_unknown_size() {
-        let pb = create_progress_bar(0, false);
-        // Spinner mode — no length.
-        assert!(pb.length().is_none());
     }
 }

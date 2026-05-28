@@ -18,15 +18,10 @@ RUN cargo build --release && \
 RUN apk add --no-cache upx && \
     upx --best --lzma /s3-uploader
 
-# Stage 2: Scratch + CA certs from builder (minimal size)
+# Stage 2: Scratch + CA certs (no /tmp needed — true streaming)
 FROM scratch
 
 COPY --from=builder /s3-uploader /s3-uploader
 COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
-
-# Ensure /tmp exists for stdin temp files (scratch has no directories)
-COPY --from=builder /tmp /tmp
-
 ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
-
 ENTRYPOINT ["/s3-uploader"]
