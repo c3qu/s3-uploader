@@ -11,7 +11,7 @@ use tokio::sync::{mpsc, Semaphore};
 use tokio::task::JoinSet;
 
 const PART_SIZE: usize = 5 * 1024 * 1024; // 5 MiB 最小分片大小
-const CHUNK_SIZE: usize = 64 * 1024;     // 64 KiB 缓冲区大小
+const CHUNK_SIZE: usize = 64 * 1024; // 64 KiB 缓冲区大小
 const MAX_CONCURRENT_UPLOADS: usize = 4; // 并发上传分片数
 
 #[derive(Parser)]
@@ -107,7 +107,12 @@ impl Uploader {
 
 // ── 1. 单文件单次 PUT 上传 ──
 
-fn file_feeder(path: PathBuf, mut sender: hyper_0_14::body::Sender, uploader: Uploader, show_progress: bool) {
+fn file_feeder(
+    path: PathBuf,
+    mut sender: hyper_0_14::body::Sender,
+    uploader: Uploader,
+    show_progress: bool,
+) {
     tokio::spawn(async move {
         let mut file = match tokio::fs::File::open(&path).await {
             Ok(f) => f,
@@ -154,7 +159,12 @@ fn file_feeder(path: PathBuf, mut sender: hyper_0_14::body::Sender, uploader: Up
                 if now.duration_since(last_display).as_millis() >= 1000 {
                     let total = uploader.count();
                     let s = now.duration_since(display_start).as_secs();
-                    eprint!("\r[{:02}:{:02}] {} uploaded    ", s / 60, s % 60, human_bytes(total));
+                    eprint!(
+                        "\r[{:02}:{:02}] {} uploaded    ",
+                        s / 60,
+                        s % 60,
+                        human_bytes(total)
+                    );
                     std::io::stderr().flush().ok();
                     last_display = now;
                 }
@@ -164,9 +174,19 @@ fn file_feeder(path: PathBuf, mut sender: hyper_0_14::body::Sender, uploader: Up
     });
 }
 
-fn file_body(path: &Path, counter: Arc<AtomicU64>, done: Arc<AtomicBool>, show_progress: bool) -> ByteStream {
+fn file_body(
+    path: &Path,
+    counter: Arc<AtomicU64>,
+    done: Arc<AtomicBool>,
+    show_progress: bool,
+) -> ByteStream {
     let (sender, body) = hyper_0_14::Body::channel();
-    file_feeder(path.to_path_buf(), sender, Uploader { counter, done }, show_progress);
+    file_feeder(
+        path.to_path_buf(),
+        sender,
+        Uploader { counter, done },
+        show_progress,
+    );
     ByteStream::from_body_0_4(body)
 }
 
@@ -181,7 +201,7 @@ async fn upload_multipart_stream<R>(
     uploader: &Uploader,
     max_retries: u32,
     show_progress: bool,
-) -> Result<u64, Box<dyn std::error::Error>> 
+) -> Result<u64, Box<dyn std::error::Error>>
 where
     R: Read + Send + 'static,
 {
@@ -203,7 +223,12 @@ where
             loop {
                 let elapsed = start.elapsed().as_secs();
                 let n = dc.load(Ordering::Relaxed);
-                eprint!("\r[{:02}:{:02}] {} uploaded    ", elapsed / 60, elapsed % 60, human_bytes(n));
+                eprint!(
+                    "\r[{:02}:{:02}] {} uploaded    ",
+                    elapsed / 60,
+                    elapsed % 60,
+                    human_bytes(n)
+                );
                 std::io::stderr().flush().ok();
                 if dd.load(Ordering::Relaxed) {
                     break;
@@ -219,7 +244,7 @@ where
         let mut buffer: Vec<u8> = Vec::with_capacity(PART_SIZE);
 
         // 利用作用域确保异常或正常退出时，_tx_guard 自动释放，Rx 端能正确接收到 None
-        let _tx_guard = tx; 
+        let _tx_guard = tx;
 
         loop {
             match reader.read(&mut read_buf) {
@@ -257,7 +282,10 @@ where
         .send()
         .await?;
 
-    let upload_id = create_upload.upload_id().ok_or("Missing upload_id")?.to_string();
+    let upload_id = create_upload
+        .upload_id()
+        .ok_or("Missing upload_id")?
+        .to_string();
 
     // 核心改进：引入并发控制，利用 JoinSet 并发上传不同 Part
     let mut join_set = JoinSet::new();
@@ -457,7 +485,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let counter = Arc::new(AtomicU64::new(0));
     let done = Arc::new(AtomicBool::new(false));
-    let uploader = Uploader { counter: counter.clone(), done: done.clone() };
+    let uploader = Uploader {
+        counter: counter.clone(),
+        done: done.clone(),
+    };
 
     let total_bytes = if let Some(ref file_path) = cli.file {
         let meta = std::fs::metadata(file_path)?;
@@ -466,7 +497,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // 优化点：如果文件大小超过限制(这里界定为大于 PART_SIZE)，则自动降级为多段流式上传
         if size > PART_SIZE as u64 {
             let file = std::fs::File::open(file_path)?;
-            upload_multipart_stream(&client, &cli.bucket, &cli.key, content_type, file, &uploader, cli.retries, !cli.no_progress).await?
+            upload_multipart_stream(
+                &client,
+                &cli.bucket,
+                &cli.key,
+                content_type,
+                file,
+                &uploader,
+                cli.retries,
+                !cli.no_progress,
+            )
+            .await?
         } else {
             if size == 0 {
                 eprintln!("Warning: input is empty, uploading 0 bytes");
@@ -505,7 +546,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         // 从标准输入读取流式多段上传
         let stdin = std::io::stdin();
-        upload_multipart_stream(&client, &cli.bucket, &cli.key, content_type, stdin, &uploader, cli.retries, !cli.no_progress).await?
+        upload_multipart_stream(
+            &client,
+            &cli.bucket,
+            &cli.key,
+            content_type,
+            stdin,
+            &uploader,
+            cli.retries,
+            !cli.no_progress,
+        )
+        .await?
     };
 
     uploader.finish();
@@ -530,6 +581,9 @@ mod tests {
         assert_eq!(detect_content_type("a.jpg"), "image/jpeg");
         assert_eq!(detect_content_type("a.html"), "text/html");
         assert_eq!(detect_content_type("a.json"), "application/json");
-        assert_eq!(detect_content_type("a.nosuchext"), "application/octet-stream");
+        assert_eq!(
+            detect_content_type("a.nosuchext"),
+            "application/octet-stream"
+        );
     }
 }
