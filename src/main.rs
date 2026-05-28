@@ -18,7 +18,13 @@ const MAX_CONCURRENT_UPLOADS: usize = 4; // 并发上传分片数
 #[command(
     name = "s3-uploader",
     version,
-    about = "Upload files to Amazon S3 or compatible services (MinIO, Cloudflare R2, etc.)"
+    about = "Upload files to Amazon S3 or compatible services (MinIO, Cloudflare R2, etc.)",
+    after_help = "Environment variables:\n  \
+                  AWS_ACCESS_KEY_ID       AWS access key (required)\n  \
+                  AWS_SECRET_ACCESS_KEY   AWS secret key (required)\n  \
+                  AWS_REGION              AWS region [env: AWS_REGION]\n  \
+                  S3_BUCKET               S3 bucket name [env: S3_BUCKET]\n  \
+                  AWS_ENDPOINT_URL        Custom S3 endpoint [env: AWS_ENDPOINT_URL]"
 )]
 struct Cli {
     /// S3 bucket name
@@ -34,7 +40,7 @@ struct Cli {
     region: String,
 
     /// Custom S3 endpoint (e.g., for MinIO or Cloudflare R2)
-    #[arg(short = 'e', long, env = "S3_ENDPOINT")]
+    #[arg(short = 'e', long, env = "AWS_ENDPOINT_URL")]
     endpoint: Option<String>,
 
     /// Content-Type (auto-detected from key extension if not set)

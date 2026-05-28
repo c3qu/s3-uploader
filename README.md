@@ -75,12 +75,18 @@ Options:
 ### Amazon S3
 
 ```bash
+export AWS_ACCESS_KEY_ID="AKIAIOSFODNN7EXAMPLE"
+export AWS_SECRET_ACCESS_KEY="wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+
 s3-uploader -b my-bucket -k file.txt -r us-east-1 ./file.txt
 ```
 
 ### Cloudflare R2
 
 ```bash
+export AWS_ACCESS_KEY_ID="<r2-access-key-id>"
+export AWS_SECRET_ACCESS_KEY="<r2-secret-access-key>"
+
 s3-uploader \
   -b my-bucket -k file.txt \
   -e "https://<account_id>.r2.cloudflarestorage.com" \
@@ -91,6 +97,9 @@ s3-uploader \
 ### MinIO / LocalStack
 
 ```bash
+export AWS_ACCESS_KEY_ID="minioadmin"
+export AWS_SECRET_ACCESS_KEY="minioadmin"
+
 s3-uploader \
   -b my-bucket -k file.txt \
   -e http://localhost:9000 \

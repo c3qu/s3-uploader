@@ -1,6 +1,6 @@
 [package]
 name = "s3-uploader"
-version = "0.1.5"
+version = "0.1.6"
 edition = "2021"
 description = "Minimal, fast CLI for uploading files to Amazon S3 and compatible services (Cloudflare R2, MinIO). Supports pipe input and progress bars."
 license = "MIT"
