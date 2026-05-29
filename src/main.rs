@@ -568,24 +568,4 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn human_bytes_basic() {
-        assert_eq!(human_bytes(0), "0 B");
-        assert_eq!(human_bytes(1024), "1.0 KiB");
-        assert_eq!(human_bytes(1024 * 1024), "1.0 MiB");
-    }
-
-    #[test]
-    fn detect_content_type_works() {
-        assert_eq!(detect_content_type("a.jpg"), "image/jpeg");
-        assert_eq!(detect_content_type("a.html"), "text/html");
-        assert_eq!(detect_content_type("a.json"), "application/json");
-        assert_eq!(
-            detect_content_type("a.nosuchext"),
-            "application/octet-stream"
-        );
-    }
-}
+mod tests;
